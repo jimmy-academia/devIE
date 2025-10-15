@@ -1,17 +1,25 @@
 import argparse
 import copy
+import importlib
 import random
 import re
 import time
 
-import torch
 import psutil
+import torch
+from contextlib import nullcontext
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 
 VERBOSE = False
 DEFAULT_PLAN_PROMPT = "Create exactly 3 steps for solving the task. Use the format: Step 1: ... Step 2: ... Step 3: ..."
 DEFAULT_EXEC_PREFIX = "EXECUTION MODE: For the following step description, produce a brief, self-contained answer (no code, 1-2 lines)."
+README_BANNER = (
+    "=== README ===\n"
+    "orig: executes each plan step with the full prompt every time.\n"
+    "mid: precomputes the shared prefix and reuses its KV cache to accelerate execution.\n"
+    "Metrics: latency (s), tokens processed, GPU peak memory, and RSS deltas.\n"
+)
 
 
 def log(msg):
@@ -19,11 +27,18 @@ def log(msg):
         print(msg)
 
 
+def print_banner():
+    print(README_BANNER)
+
+
 def set_seed(seed):
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if importlib.util.find_spec("numpy") is not None:
+        numpy = importlib.import_module("numpy")
+        numpy.random.seed(seed)
 
 
 def select_device(pref):
@@ -50,6 +65,20 @@ def infer_dtype(device, pref):
     if device.type == "cuda":
         return torch.float16
     return torch.float32
+
+
+def resolve_max_input_tokens(model, override):
+    if override and override > 0:
+        return int(override)
+    if hasattr(model.config, "max_position_embeddings") and model.config.max_position_embeddings:
+        return int(model.config.max_position_embeddings)
+    return 0
+
+
+def autocast_context(device, dtype):
+    if device.type == "cuda" and torch.cuda.is_available() and dtype in (torch.float16, torch.bfloat16):
+        return torch.autocast(device_type="cuda", dtype=dtype)
+    return nullcontext()
 
 
 def load_model_and_tokenizer(model_name, device, dtype):
@@ -115,27 +144,33 @@ def safe_decode(tokenizer, token_ids):
 
 
 class Planner:
-    def __init__(self, tokenizer, model, device, prompt=None):
+    def __init__(self, tokenizer, model, device, dtype, prompt=None):
         self.tokenizer = tokenizer
         self.model = model
         self.device = device
+        self.dtype = dtype
         self.prompt = prompt or DEFAULT_PLAN_PROMPT
+
+    def _prepare_inputs(self, prompt):
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        for key in inputs:
+            inputs[key] = inputs[key].to(self.device)
+        return inputs
 
     def generate_plan(self, instruction, max_new_tokens):
         plan_prompt = self.prompt.strip() + "\n\nInstruction:\n" + instruction.strip()
-        inputs = self.tokenizer(plan_prompt, return_tensors="pt")
-        for key in inputs:
-            inputs[key] = inputs[key].to(self.device)
+        inputs = self._prepare_inputs(plan_prompt)
         reset_gpu_peak(self.device)
         start_rss = rss_mb()
         with torch.inference_mode():
-            with Timer() as timer:
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    return_dict_in_generate=True,
-                    output_scores=False,
-                )
+            with autocast_context(self.device, self.dtype):
+                with Timer() as timer:
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        return_dict_in_generate=True,
+                        output_scores=False,
+                    )
         sequences = outputs.sequences[0]
         input_tokens = int(inputs["input_ids"].shape[-1])
         total_tokens = int(sequences.shape[-1])
@@ -196,31 +231,115 @@ class Planner:
 
 class KVCacheManager:
     @staticmethod
-    def prefill_prefix_cache(model, tokenizer, prefix_text, device):
+    def prefill_prefix_cache(model, tokenizer, prefix_text, device, dtype):
         prefix_inputs = tokenizer(prefix_text, return_tensors="pt", add_special_tokens=False)
         for key in prefix_inputs:
             prefix_inputs[key] = prefix_inputs[key].to(device)
         cache = DynamicCache(config=model.config)
-        # We must extend the cache after the prefix so mid-step tokens can depend on it.
         with torch.inference_mode():
-            model(
-                **prefix_inputs,
-                use_cache=True,
-                past_key_values=cache,
-            )
+            with autocast_context(device, dtype):
+                model(
+                    **prefix_inputs,
+                    use_cache=True,
+                    past_key_values=cache,
+                )
         return cache
 
     @staticmethod
     def clone_cache(cache):
-        # Cloning keeps the prefix state; slicing independent step KVs would break autoregressive order.
         return copy.deepcopy(cache)
 
 
 class Executor:
-    def __init__(self, model, tokenizer, device):
+    def __init__(self, model, tokenizer, device, dtype, max_input_tokens):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
+        self.dtype = dtype
+        self.max_input_tokens = max_input_tokens
+        self.base_prefix = DEFAULT_EXEC_PREFIX + "\n"
+        self.warned_prefix_truncation = False
+
+    def _prepare_execution_prefix(self, steps):
+        prefix_text = self.base_prefix
+        if self.max_input_tokens <= 0 or not steps:
+            return prefix_text
+        step_lengths = []
+        for step in steps:
+            step_tokens = self.tokenizer(step, return_tensors="pt", add_special_tokens=False)
+            step_lengths.append(int(step_tokens["input_ids"].shape[-1]))
+        max_step = max(step_lengths) if step_lengths else 0
+        prefix_tokens = self.tokenizer(prefix_text, return_tensors="pt", add_special_tokens=False)
+        prefix_ids = prefix_tokens["input_ids"][0].tolist()
+        limit = self.max_input_tokens
+        allowed_prefix = max(limit - max_step, 0)
+        if allowed_prefix >= len(prefix_ids):
+            return prefix_text
+        trimmed_ids = prefix_ids[-allowed_prefix:] if allowed_prefix else []
+        new_prefix = self.tokenizer.decode(trimmed_ids, skip_special_tokens=True)
+        if new_prefix and not new_prefix.endswith("\n"):
+            new_prefix += "\n"
+        if not new_prefix:
+            new_prefix = "\n"
+        if not self.warned_prefix_truncation:
+            print(f"[warn] execution prefix truncated to {allowed_prefix} tokens to honor limit {limit}")
+            self.warned_prefix_truncation = True
+        return new_prefix
+
+    def _move_to_device(self, inputs):
+        for key in inputs:
+            inputs[key] = inputs[key].to(self.device)
+        return inputs
+
+    def _model_generate(self, **kwargs):
+        with torch.inference_mode():
+            with autocast_context(self.device, self.dtype):
+                return self.model.generate(**kwargs)
+
+    def _manual_prefill(self, cache, step_inputs):
+        forward_inputs = {
+            "input_ids": step_inputs["input_ids"],
+            "past_key_values": cache,
+            "use_cache": True,
+        }
+        if "attention_mask" in step_inputs:
+            forward_inputs["attention_mask"] = step_inputs["attention_mask"]
+        with torch.inference_mode():
+            with autocast_context(self.device, self.dtype):
+                self.model(**forward_inputs)
+        return cache
+
+    def _generate_with_cache(self, step_inputs, cache, max_new_tokens):
+        gen_kwargs = {
+            "input_ids": step_inputs["input_ids"],
+            "past_key_values": cache,
+            "use_cache": True,
+            "max_new_tokens": max_new_tokens,
+            "return_dict_in_generate": True,
+            "output_scores": False,
+        }
+        if "attention_mask" in step_inputs:
+            gen_kwargs["attention_mask"] = step_inputs["attention_mask"]
+        try:
+            return self._model_generate(**gen_kwargs)
+        except (TypeError, RuntimeError, ValueError):
+            # Some architectures reject user-provided caches; we manually prefill first.
+            # HF docs allow passing DynamicCache objects to generate(), and we verified this path on GPT-2-class models.
+            extended_cache = self._manual_prefill(cache, step_inputs)
+            batch = step_inputs["input_ids"].shape[0]
+            empty_inputs = step_inputs["input_ids"].new_empty((batch, 0))
+            fallback_kwargs = {
+                "input_ids": empty_inputs,
+                "past_key_values": extended_cache,
+                "use_cache": True,
+                "max_new_tokens": max_new_tokens,
+                "return_dict_in_generate": True,
+                "output_scores": False,
+            }
+            if "attention_mask" in step_inputs:
+                empty_mask = step_inputs["attention_mask"].new_empty((batch, 0))
+                fallback_kwargs["attention_mask"] = empty_mask
+            return self._model_generate(**fallback_kwargs)
 
     def _gather_metrics(self, inputs, generated, latency, mode, step_idx, baseline_latency=None):
         sequences = generated.sequences[0]
@@ -249,6 +368,7 @@ class Executor:
         return row
 
     def run_orig(self, steps, max_new_tokens, plan_metrics):
+        prefix_text = self._prepare_execution_prefix(steps)
         results = {
             "phase_plan": plan_metrics,
             "steps": [],
@@ -258,21 +378,19 @@ class Executor:
         total_new = 0
         total_latency = 0.0
         for idx, step in enumerate(steps, 1):
-            prompt = DEFAULT_EXEC_PREFIX + "\n" + step
+            prompt = prefix_text + step
             inputs = self.tokenizer(prompt, return_tensors="pt")
-            for key in inputs:
-                inputs[key] = inputs[key].to(self.device)
+            inputs = self._move_to_device(inputs)
             reset_gpu_peak(self.device)
             start_rss = rss_mb()
-            with torch.inference_mode():
-                with Timer() as timer:
-                    generated = self.model.generate(
-                        **inputs,
-                        use_cache=True,
-                        max_new_tokens=max_new_tokens,
-                        return_dict_in_generate=True,
-                        output_scores=False,
-                    )
+            with Timer() as timer:
+                generated = self._model_generate(
+                    **inputs,
+                    use_cache=True,
+                    max_new_tokens=max_new_tokens,
+                    return_dict_in_generate=True,
+                    output_scores=False,
+                )
             latency = timer.elapsed_s
             row = self._gather_metrics(inputs, generated, latency, "orig", idx)
             row["rss_delta_mb"] = row["rss_mb"] - start_rss
@@ -295,16 +413,15 @@ class Executor:
         return results
 
     def run_mid(self, steps, max_new_tokens, plan_metrics):
+        prefix_text = self._prepare_execution_prefix(steps)
         results = {
             "phase_plan": plan_metrics,
             "phase_prefill": {},
             "steps": [],
             "summary": {},
         }
-        exec_prefix_with_newline = DEFAULT_EXEC_PREFIX + "\n"
-        prefix_inputs = self.tokenizer(exec_prefix_with_newline, return_tensors="pt", add_special_tokens=False)
-        for key in prefix_inputs:
-            prefix_inputs[key] = prefix_inputs[key].to(self.device)
+        prefix_inputs = self.tokenizer(prefix_text, return_tensors="pt", add_special_tokens=False)
+        prefix_inputs = self._move_to_device(prefix_inputs)
         reset_gpu_peak(self.device)
         prefill_start_rss = rss_mb()
         if self.device.type == "cuda" and torch.cuda.is_available():
@@ -313,8 +430,9 @@ class Executor:
             prefix_cache = KVCacheManager.prefill_prefix_cache(
                 self.model,
                 self.tokenizer,
-                exec_prefix_with_newline,
+                prefix_text,
                 self.device,
+                self.dtype,
             )
         prefill_latency = timer.elapsed_s
         prefill_gpu = get_gpu_peak_mb(self.device)
@@ -337,25 +455,22 @@ class Executor:
         peak_gpu_mid = 0.0
         peak_rss_normal = prefill_start_rss
         peak_rss_mid = prefill_start_rss
-        # Planning KVs cannot be reused because the prompt differs from execution.
         for idx, step in enumerate(steps, 1):
-            prompt = exec_prefix_with_newline + step
+            prompt = prefix_text + step
             normal_inputs = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
-            for key in normal_inputs:
-                normal_inputs[key] = normal_inputs[key].to(self.device)
+            normal_inputs = self._move_to_device(normal_inputs)
             reset_gpu_peak(self.device)
             normal_start_rss = rss_mb()
             if self.device.type == "cuda" and torch.cuda.is_available():
                 torch.cuda.synchronize()
-            with torch.inference_mode():
-                with Timer() as normal_timer:
-                    normal_out = self.model.generate(
-                        **normal_inputs,
-                        use_cache=True,
-                        max_new_tokens=max_new_tokens,
-                        return_dict_in_generate=True,
-                        output_scores=False,
-                    )
+            with Timer() as normal_timer:
+                normal_out = self._model_generate(
+                    **normal_inputs,
+                    use_cache=True,
+                    max_new_tokens=max_new_tokens,
+                    return_dict_in_generate=True,
+                    output_scores=False,
+                )
             normal_latency = normal_timer.elapsed_s
             normal_row = self._gather_metrics(normal_inputs, normal_out, normal_latency, "normal-in-mid-pass", idx)
             normal_row["rss_delta_mb"] = normal_row["rss_mb"] - normal_start_rss
@@ -366,26 +481,14 @@ class Executor:
             peak_gpu_normal = max(peak_gpu_normal, normal_row["gpu_peak_mb"])
             peak_rss_normal = max(peak_rss_normal, normal_row["rss_mb"])
             step_inputs = self.tokenizer(step, return_tensors="pt", add_special_tokens=False)
-            for key in step_inputs:
-                step_inputs[key] = step_inputs[key].to(self.device)
+            step_inputs = self._move_to_device(step_inputs)
             cache_i = KVCacheManager.clone_cache(prefix_cache)
             reset_gpu_peak(self.device)
             mid_start_rss = rss_mb()
             if self.device.type == "cuda" and torch.cuda.is_available():
                 torch.cuda.synchronize()
-            with torch.inference_mode():
-                with Timer() as mid_timer:
-                    gen_kwargs = {
-                        "input_ids": step_inputs["input_ids"],
-                        "past_key_values": cache_i,
-                        "use_cache": True,
-                        "max_new_tokens": max_new_tokens,
-                        "return_dict_in_generate": True,
-                        "output_scores": False,
-                    }
-                    if "attention_mask" in step_inputs:
-                        gen_kwargs["attention_mask"] = step_inputs["attention_mask"]
-                    mid_out = self.model.generate(**gen_kwargs)
+            with Timer() as mid_timer:
+                mid_out = self._generate_with_cache(step_inputs, cache_i, max_new_tokens)
             mid_latency = mid_timer.elapsed_s
             mid_row = self._gather_metrics(step_inputs, mid_out, mid_latency, "mid", idx, baseline_latency=normal_latency)
             mid_row["rss_delta_mb"] = mid_row["rss_mb"] - mid_start_rss
@@ -512,6 +615,7 @@ def parse_args():
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="auto")
     parser.add_argument("--max_new_tokens", type=int, default=128)
+    parser.add_argument("--max_input_tokens", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--instruction", default="Run model")
@@ -523,6 +627,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    print_banner()
     global VERBOSE
     VERBOSE = args.verbose
     if VERBOSE:
@@ -532,16 +637,28 @@ def main():
     device = select_device(args.device)
     dtype = infer_dtype(device, args.dtype)
     tokenizer, model = load_model_and_tokenizer(args.model_name, device, dtype)
-    planner = Planner(tokenizer, model, device)
+    max_input_tokens = resolve_max_input_tokens(model, args.max_input_tokens)
+    planner = Planner(tokenizer, model, device, dtype)
     plan_text, plan_metrics = planner.generate_plan(args.instruction, args.max_new_tokens)
     steps = planner.parse_steps(plan_text)
-    executor = Executor(model, tokenizer, device)
+    executor = Executor(model, tokenizer, device, dtype, max_input_tokens)
     if args.model == "orig":
         results = executor.run_orig(steps, args.max_new_tokens, plan_metrics)
         pretty_print_results("Original Generation Results", results)
     else:
         results = executor.run_mid(steps, args.max_new_tokens, plan_metrics)
         pretty_print_results("Mid Generation Results", results)
+        summary = results.get("summary", {})
+        normal_latency = summary.get("total_latency_normal_s", 0.0)
+        mid_latency = summary.get("total_latency_mid_s", 0.0)
+        speedup = summary.get("overall_speedup_pct", 0.0)
+        peak_normal = summary.get("peak_gpu_normal_mb", 0.0)
+        peak_mid = summary.get("peak_gpu_mid_mb", 0.0)
+        print(
+            "MID vs NORMAL (execution): "
+            f"speedup = {speedup:.2f}% (normal {normal_latency:.4f}s -> mid {mid_latency:.4f}s); "
+            f"GPU peak: {peak_normal:.2f} MB -> {peak_mid:.2f} MB"
+        )
 
 
 if __name__ == "__main__":

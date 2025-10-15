@@ -1,8 +1,11 @@
 import argparse
 import os
-import psutil
 import random
+import re
+import resource
 import time
+
+import sys
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -17,7 +20,6 @@ def log(msg):
 
 
 def set_seed(seed):
-    """Seed random generators for reproducibility."""
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -25,7 +27,6 @@ def set_seed(seed):
 
 
 def select_device(pref):
-    """Select device based on user preference and availability."""
     if pref == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if pref == "cuda":
@@ -36,7 +37,6 @@ def select_device(pref):
 
 
 def infer_dtype(device, pref):
-    """Infer torch dtype from preference and device."""
     if pref == "float32":
         return torch.float32
     if pref == "float16":
@@ -53,25 +53,21 @@ def infer_dtype(device, pref):
 
 
 def load_model_and_tokenizer(model_name, device, dtype):
-    """Load tokenizer and model, adjust padding, and move to device."""
     log(f"Loading model {model_name} on {device} with dtype {dtype}")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     if device.type == "cuda":
         model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype, device_map="auto")
-        model.eval()
     else:
         model = AutoModelForCausalLM.from_pretrained(model_name)
         model.to(device)
         model.to(dtype=dtype)
-        model.eval()
+    model.eval()
     return tokenizer, model
 
 
 class Timer:
-    """Context manager for timing code blocks."""
-
     def __init__(self):
         self.start = None
         self.elapsed_s = 0.0
@@ -85,42 +81,46 @@ class Timer:
     def __exit__(self, exc_type, exc, tb):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        end = time.perf_counter()
-        self.elapsed_s = end - self.start
+        self.elapsed_s = time.perf_counter() - self.start
         return False
 
 
-def reset_gpu_peak():
-    """Reset CUDA peak memory stats if available."""
-    try:
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-    except Exception:
-        pass
+def reset_gpu_peak(device):
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
 
-def get_gpu_peak_mb():
-    """Get CUDA peak memory in MB."""
-    try:
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            return torch.cuda.max_memory_allocated() / 1e6
-    except Exception:
-        pass
+def get_gpu_peak_mb(device):
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() / 1e6
     return 0.0
 
 
 def rss_mb():
-    """Report current resident set size in MB."""
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss / 1e6
+    statm_path = "/proc/self/statm"
+    if os.path.exists(statm_path):
+        with open(statm_path) as handle:
+            fields = handle.read().split()
+        if len(fields) >= 2:
+            rss_pages = int(fields[1])
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            return rss_pages * page_size / 1e6
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    if sys.platform == "darwin":
+        return usage.ru_maxrss / 1e6
+    return usage.ru_maxrss / 1024
 
 
 def tokens_per_second(num_tokens, seconds):
-    """Compute tokens per second given latency."""
     if seconds <= 0:
         return 0.0
     return num_tokens / seconds
+
+
+def safe_decode(tokenizer, token_ids):
+    text = tokenizer.decode(token_ids, skip_special_tokens=True)
+    return text.strip()
 
 
 DEFAULT_PLAN_PROMPT = "Create exactly 3 steps for solving the task. Use the format: Step 1: ... Step 2: ... Step 3: ..."
@@ -128,96 +128,195 @@ DEFAULT_EXEC_PREFIX = "EXECUTION MODE: For the following step description, produ
 
 
 class Planner:
-    """Placeholder planner for generating action steps."""
-
-    def __init__(self, prompt=None):
+    def __init__(self, tokenizer, model, device, prompt=None):
+        self.tokenizer = tokenizer
+        self.model = model
+        self.device = device
         self.prompt = prompt or DEFAULT_PLAN_PROMPT
 
-    def generate_plan(self, instruction):
-        """Return a canned plan response."""
-        return "Step 1: Understand instructions\nStep 2: Prepare data\nStep 3: Produce answer"
+    def generate_plan(self, instruction, max_new_tokens):
+        plan_prompt = self.prompt.strip() + "\n\nInstruction:\n" + instruction.strip()
+        inputs = self.tokenizer(plan_prompt, return_tensors="pt")
+        for key in inputs:
+            inputs[key] = inputs[key].to(self.device)
+        reset_gpu_peak(self.device)
+        start_rss = rss_mb()
+        with torch.inference_mode():
+            with Timer() as timer:
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    return_dict_in_generate=True,
+                    output_scores=False,
+                )
+        sequences = outputs.sequences[0]
+        input_tokens = int(inputs["input_ids"].shape[-1])
+        total_tokens = int(sequences.shape[-1])
+        new_tokens = max(total_tokens - input_tokens, 0)
+        plan_text = safe_decode(self.tokenizer, sequences)
+        end_rss = rss_mb()
+        metrics = {
+            "mode": "plan",
+            "latency_s": timer.elapsed_s,
+            "input_tokens": input_tokens,
+            "new_tokens": new_tokens,
+            "gpu_peak_mb": get_gpu_peak_mb(self.device),
+            "rss_delta_mb": end_rss - start_rss,
+            "rss_mb": end_rss,
+            "text": plan_text,
+        }
+        return plan_text, metrics
 
     def parse_steps(self, plan_text):
-        """Parse plan text into individual steps."""
-        return ["Understand instructions", "Prepare data", "Produce answer"]
+        steps_map = {}
+        for match in re.finditer(r"Step\s*(\d+)\s*:\s*(.+)", plan_text, re.IGNORECASE):
+            idx = int(match.group(1))
+            text = match.group(2).strip()
+            if text and idx not in steps_map:
+                steps_map[idx] = text
+        lines = plan_text.splitlines()
+        extra = []
+        for line in lines:
+            stripped = line.strip()
+            bullet = re.match(r"^-\s+(.*)", stripped)
+            numbered = re.match(r"^(\d+)[\.)]\s+(.*)", stripped)
+            candidate = None
+            if bullet:
+                candidate = bullet.group(1).strip()
+            elif numbered:
+                candidate = numbered.group(2).strip()
+            if candidate:
+                if candidate not in extra:
+                    extra.append(candidate)
+        ordered = []
+        for idx in sorted(steps_map):
+            ordered.append(steps_map[idx])
+        for item in extra:
+            if len(ordered) >= 3:
+                break
+            if item not in ordered:
+                ordered.append(item)
+        defaults = [
+            "Clarify the task requirements",
+            "Collect or review necessary context",
+            "Draft a concise response",
+        ]
+        while len(ordered) < 3:
+            ordered.append(defaults[len(ordered)])
+        if len(ordered) > 3:
+            ordered = ordered[:3]
+        return ordered
 
 
 class KVCacheManager:
-    """Placeholder for KV-cache regeneration utilities."""
-
     def __init__(self):
-        """Initialize future KV-cache manager."""
+        pass
 
 
 class Executor:
-    """Executes generation strategies and records metrics."""
-
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer, device):
         self.model = model
         self.tokenizer = tokenizer
+        self.device = device
 
-    def run_orig(self, steps, max_new_tokens):
-        """Simulate original inference run using provided steps."""
+    def run_orig(self, steps, max_new_tokens, plan_metrics):
         results = {
-            "phase": "inference",
-            "mode": "orig",
-            "steps": []
+            "phase_plan": plan_metrics,
+            "steps": [],
+            "summary": {},
         }
-        reset_gpu_peak()
-        base_tokens = 16
+        total_input = 0
+        total_new = 0
+        total_latency = 0.0
         for idx, step in enumerate(steps, 1):
-            with Timer() as timer:
-                encoded = self.tokenizer(step, return_tensors="pt")
-                input_tokens = int(encoded["input_ids"].shape[-1])
-                new_tokens = min(max_new_tokens, base_tokens + idx)
-                time.sleep(0.01)
-            entry = {
+            prompt = DEFAULT_EXEC_PREFIX + "\n" + step
+            inputs = self.tokenizer(prompt, return_tensors="pt")
+            for key in inputs:
+                inputs[key] = inputs[key].to(self.device)
+            reset_gpu_peak(self.device)
+            start_rss = rss_mb()
+            with torch.inference_mode():
+                with Timer() as timer:
+                    generated = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        return_dict_in_generate=True,
+                        output_scores=False,
+                    )
+            sequences = generated.sequences[0]
+            input_tokens = int(inputs["input_ids"].shape[-1])
+            total_tokens = int(sequences.shape[-1])
+            new_tokens = max(total_tokens - input_tokens, 0)
+            latency = timer.elapsed_s
+            tok_rate = tokens_per_second(new_tokens, latency)
+            gpu_peak = get_gpu_peak_mb(self.device)
+            current_rss = rss_mb()
+            step_entry = {
+                "mode": "orig",
                 "step_idx": idx,
-                "description": step,
                 "input_tokens": input_tokens,
                 "new_tokens": new_tokens,
-                "latency_s": timer.elapsed_s,
-                "tok_per_s": tokens_per_second(new_tokens, timer.elapsed_s),
-                "gpu_peak_mb": get_gpu_peak_mb(),
-                "rss_mb": rss_mb(),
+                "latency_s": latency,
+                "tok_per_s": tok_rate,
+                "gpu_peak_mb": gpu_peak,
+                "rss_mb": current_rss,
             }
-            results["steps"].append(entry)
+            results["steps"].append(step_entry)
+            total_input += input_tokens
+            total_new += new_tokens
+            total_latency += latency
+        count = len(results["steps"])
+        avg_latency = total_latency / count if count else 0.0
+        avg_tok_per_s = tokens_per_second(total_new, total_latency) if total_latency > 0 else 0.0
+        results["summary"] = {
+            "mode": "orig",
+            "total_steps": count,
+            "total_input_tokens": total_input,
+            "total_new_tokens": total_new,
+            "total_latency_s": total_latency,
+            "avg_latency_s": avg_latency,
+            "avg_tok_per_s": avg_tok_per_s,
+        }
         return results
 
-    def run_mid(self, steps, max_new_tokens):
-        """Placeholder for mid-sequence KV cache regeneration run."""
+    def run_mid(self, steps, max_new_tokens, plan_metrics):
         raise NotImplementedError("mid mode not implemented yet")
 
 
 def pretty_print_results(title, results):
-    """Print results in a simple ASCII table."""
-    headers = [
-        "phase",
-        "mode",
-        "step_idx",
-        "input_tokens",
-        "new_tokens",
-        "latency_s",
-        "tok_per_s",
-        "gpu_peak_mb",
-        "rss_mb",
-    ]
     print(title)
-    print("| " + " | ".join(headers) + " |")
-    print("|" + "---|" * len(headers))
-    for step in results["steps"]:
-        row = [
-            results["phase"],
-            results["mode"],
-            str(step["step_idx"]),
-            str(step["input_tokens"]),
-            str(step["new_tokens"]),
-            f"{step['latency_s']:.4f}",
-            f"{step['tok_per_s']:.2f}",
-            f"{step['gpu_peak_mb']:.2f}",
-            f"{step['rss_mb']:.2f}",
-        ]
-        print("| " + " | ".join(row) + " |")
+    plan = results.get("phase_plan")
+    if plan:
+        print(
+            "Planning: "
+            f"latency={plan['latency_s']:.4f}s, "
+            f"input_tokens={plan['input_tokens']}, "
+            f"new_tokens={plan['new_tokens']}, "
+            f"gpu_peak_mb={plan['gpu_peak_mb']:.2f}, "
+            f"rss_delta_mb={plan['rss_delta_mb']:.2f}"
+        )
+        print(f"Plan Text: {plan['text']}")
+    steps = results.get("steps", [])
+    if steps:
+        print("\nSteps:")
+        print("| idx | input_tokens | new_tokens | latency_s | tok_per_s | gpu_peak_mb | rss_mb |")
+        print("|---|---|---|---|---|---|---|")
+        for step in steps:
+            print(
+                f"| {step['step_idx']} | {step['input_tokens']} | {step['new_tokens']} | "
+                f"{step['latency_s']:.4f} | {step['tok_per_s']:.2f} | {step['gpu_peak_mb']:.2f} | {step['rss_mb']:.2f} |"
+            )
+    summary = results.get("summary")
+    if summary:
+        print("\nSummary:")
+        print(
+            f"Mode: {summary['mode']}, Total Steps: {summary['total_steps']}, "
+            f"Total Input Tokens: {summary['total_input_tokens']}, Total New Tokens: {summary['total_new_tokens']}"
+        )
+        print(
+            f"Total Latency: {summary['total_latency_s']:.4f}s, Avg Latency: {summary['avg_latency_s']:.4f}s, "
+            f"Avg Tok/s: {summary['avg_tok_per_s']:.2f}"
+        )
 
 
 def parse_args():
@@ -246,15 +345,15 @@ def main():
     device = select_device(args.device)
     dtype = infer_dtype(device, args.dtype)
     tokenizer, model = load_model_and_tokenizer(args.model_name, device, dtype)
-    planner = Planner()
-    plan_text = planner.generate_plan("Run model")
+    planner = Planner(tokenizer, model, device)
+    plan_text, plan_metrics = planner.generate_plan("Run model", args.max_new_tokens)
     steps = planner.parse_steps(plan_text)
-    executor = Executor(model, tokenizer)
+    executor = Executor(model, tokenizer, device)
     if args.model == "orig":
-        results = executor.run_orig(steps, args.max_new_tokens)
+        results = executor.run_orig(steps, args.max_new_tokens, plan_metrics)
         pretty_print_results("Original Generation Results", results)
     else:
-        print("Mid-sequence KV-cache regeneration mode is not implemented yet.")
+        raise NotImplementedError("Mid-sequence KV-cache regeneration mode is not implemented yet")
 
 
 if __name__ == "__main__":
